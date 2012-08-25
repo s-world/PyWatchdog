@@ -1,0 +1,281 @@
+#!/usr/bin/python
+
+#
+# PyWatchdog 0.2.0
+#
+# Copyright (C) 2012 S-world Team
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+#
+
+from email.mime.text import MIMEText
+
+import os
+import datetime
+import smtplib
+import socket
+import ssl
+import subprocess
+import json
+import psutil
+import argparse
+import errno
+import sys
+import urllib2
+import time
+
+class ConfigParser:
+    """Parses the configuration necessary to run pywatchdog."""
+
+    def getConfig(self):
+        """Get configuration to use for watchdog
+        The configuration file should be located at
+        - '/etc/pywatchdog/pywatchdog.conf' or
+        - '/usr/local/etc/pywatchdog/pywatchdog.conf'
+        or it should be given as command line argument.
+        """
+        parameters = self.__prepareCommandParameters()
+        config_file = self.__getConfigFilePath(parameters)
+
+        if not config_file:
+            print("Mandatory configuration file is missing.")
+            sys.exit(-1)
+
+        try:
+            with open(config_file) as config_file:
+                config_json = config_file.read()
+                config = json.loads(config_json)
+        except ValueError as err:
+            print("Configuration file contains errors: %s" % err.message)
+            sys.exit(-1)
+
+        return config
+
+    def __prepareCommandParameters(self):
+        """Prepare command line argument parser and return parsed command line arguments.
+
+        Return:
+        command line arguments
+        """
+        parser = argparse.ArgumentParser(description='Test if we applications are running and restart if needed.')
+        parser.add_argument('--config', dest='config', help='path to config file if it is not located in /etc/py_watch/')
+        return parser.parse_args()
+
+    def __getConfigFilePath(self, parameters):
+        """Get path of the config file to use.
+
+        Keyword arguments:
+        parameters -- parsed command line arguments
+        """
+        etc_config = '/etc/pywatchdog/pywatchdog.conf'
+        usr_etc_config = '/usr/local/etc/pywatchdog/pywatchdog.conf'
+
+        if parameters.__dict__['config']:
+            return parameters.__dict__['config']
+        elif os.path.exists(etc_config):
+            return etc_config
+        elif os.path.exists(usr_etc_config):
+            return usr_etc_config
+
+class FileLock():
+    """Manages a lock file to indicate if application is already running or should not run at all."""
+
+    def __init__(self, file_path):
+        """Constructor.
+
+        Keyword arguments:
+        file_path -- file path to use as lock file
+        """
+        self.__is_locked = False
+        self.__file_path = file_path
+
+    def acquire(self):
+        """Create lock file.
+
+        Return:
+        True if lock could be acquired False otherwise
+        """
+        try:
+            # use mkdir because it is an atomic operation
+            self.fd = os.mkdir(self.__file_path)
+            self.__is_locked = True
+            return True
+        except OSError as e:
+            if e.errno != errno.EEXIST:
+                return False
+
+    def release(self):
+        """Release lock file."""
+        if self.__is_locked:
+            # use rmdir because it is an atomic operation
+            os.rmdir(self.__file_path)
+            self.__is_locked = False
+
+class ProcessUtils():
+    """Offers different methods to work with processes."""
+
+    def findProcess(self, ps_identifier):
+        """Find a specific process.
+
+        Keyword arguments:
+        ps_identifier -- part of the command line arguments that uniquely identifies the process
+        """
+        for process in psutil.process_iter():
+            for argument in process.cmdline:
+                if ps_identifier in argument:
+                    return process
+
+    def killProcess(self, process):
+        """Kill a process.
+
+        Keyword arguments:
+        process -- process to kill
+        """
+        process.terminate() # SIGTERM
+        time.sleep(5)
+        while process.is_running():
+            process.kill() # kill process
+            time.sleep(5)
+
+class Mail():
+    """Represents a mail."""
+
+    def __init__(self, settings):
+        """Constructor.
+
+        Keyword arguments:
+        settings -- settings containing mail receiver, etc.
+        """
+        self.__settings = settings
+        self.__message = None
+
+    def set_message(self, message):
+        """Message of the mail.
+
+        Keyword arguments:
+        message -- message to be send
+        """
+        self.__message = MIMEText(message)
+
+    def send(self):
+        """Send the mail."""
+        if self.__message:
+            self.__message['Subject'] = 'PyWatch: Application Failure'
+            self.__message['From'] = 'PyWatch'
+            self.__message['To'] = self.__settings['mail_receiver']
+            self.__send_to_mail_server()
+
+    def __send_to_mail_server(self):
+        """Communicate with mail server and send mail."""
+        mailServer = None
+        try:
+            mailServer = smtplib.SMTP('localhost')
+            mailServer.sendmail(self.__settings['mail_sender'], self.__settings['mail_receiver'], self.__message.as_string())
+        except (smtplib.SMTPHeloError, smtplib.SMTPRecipientsRefused, smtplib.SMTPSenderRefused, smtplib.SMTPDataError, socket.error) as err:
+            print("Mail could not be sent because of '%s'" % err.strerror)
+        finally:
+            if mailServer:
+                mailServer.quit()
+
+class TimeUtils():
+    """Helper methods for working with time."""
+
+    def get_current_time(self):
+        """Get current time formatted as %Y-%m-%d %H:%M
+
+        Return:
+        Formatted current time
+        """
+        now = datetime.datetime.now()
+        return now.strftime('%Y-%m-%d %H:%M')
+
+class WatchDog():
+    """Watches an app and tests if app is running correctly.."""
+
+    def __init__(self):
+        """Constructor."""
+        self.__processUtil = ProcessUtils()
+
+    def test_availability(self, settings, app_key, app):
+        """Test if app is running correctly.
+
+        Keyword arguments:
+        settings -- settings containing mail receiver, etc.
+        app_key -- app identifier known by the user
+        app -- dict containing all necessary information about the app
+        """
+        process = self.__processUtil.findProcess(app['ps_identfier'])
+        mail = Mail(settings)
+
+        already_restarted = self.__test_app_running(app_key, app, process, mail)
+        if not already_restarted and 'url' in app:
+            self.__test_app_reachable(app_key, app, process, mail)
+        mail.send()
+
+    def __test_app_running(self, app_key, app, process, mail):
+        """Test process is running.
+
+        Keyword arguments:
+        app_key -- app identifier known by the user
+        app -- dict containing all necessary information about the app
+        process -- process to test
+        mail -- process to mail to add error message to
+
+        Return:
+        True if app is running False otherwise
+        """
+        if not process:
+            subprocess.call(app['start_script'], stderr=subprocess.STDOUT, shell=True)
+            mail.set_message(TimeUtils().get_current_time() + ': ' + app_key + ' was down and was started by me.')
+            return True
+        return False
+
+    def __test_app_reachable(self, app_key, app, process, mail):
+        """Test if application is reachable by the web (only applicable for web applications).
+
+        Keyword arguments:
+        app_key -- app identifier known by the user
+        app -- dict containing all necessary information about the app
+        process -- process to test
+        mail -- process to mail to add error message to
+        """
+        timeout = 30
+        if 'timeout' in app:
+            timeout = app['timeout']
+        try:
+            response = urllib2.urlopen(app['url'], timeout = timeout)
+            http_result_code = response.getcode()
+        except (urllib2.URLError, ssl.SSLError):
+            # thrown if there was e.g. a 500 error
+            http_result_code = 500
+
+        if http_result_code != 200:
+            self.__processUtil.killProcess(process)
+            subprocess.call(app['start_script'], stderr=subprocess.STDOUT, shell=True)
+            mail.set_message(TimeUtils().get_current_time() + ': ' + app_key + ' was not reachable and was restarted by me.')
+
+config = ConfigParser().getConfig()
+
+# we are using a file lock here because it should be possible to manual deactivate the watchdog for administration tasks (e.g. deployment)
+file_lock = FileLock('/tmp/wd.lock')
+if not file_lock.acquire():
+    sys.exit(0)
+
+try:
+    watchdog = WatchDog()
+    for app_key, app in config['apps'].items():
+        watchdog.test_availability(config['settings'], app_key, app)
+finally:
+    # close file lock under all circumstances
+    file_lock.release()
