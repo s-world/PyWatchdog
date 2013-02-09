@@ -259,6 +259,10 @@ class WatchDog():
         except (urllib2.URLError, ssl.SSLError):
             # thrown if there was e.g. a 500 error
             http_result_code = 500
+        except socket.timeout:
+            # cannot do anything because we have a general network problem
+            # skip this run and try again later
+            return
 
         if http_result_code != 200:
             self.__processUtil.killProcess(process)
